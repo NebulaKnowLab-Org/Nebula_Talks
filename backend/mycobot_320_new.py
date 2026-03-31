@@ -1,7 +1,7 @@
 """
 myCobot 320 Pi Bridge — WebSocket Server
 Lightweight bridge between FastAPI backend and myCobot hardware.
-Uses adaptive telemetry polling: 2Hz idle, 10Hz moving, 0Hz disconnected.
+Uses adaptive telemetry polling: 2Hz idle, 5Hz moving, 0Hz disconnected.
 """
 
 import asyncio
@@ -42,9 +42,11 @@ class MyCobotBridge:
 
         self.client_connected = False
         self.poll_interval_idle = 0.5      # 2Hz
-        self.poll_interval_moving = 0.1    # 10Hz
+        self.poll_interval_moving = 0.2    # 5Hz (less aggressive to avoid serial contention)
         self._speed = 50
         self._acceleration = 30
+        self._last_angles = [0.0] * 6
+        self._last_coords = [0.0] * 6
 
     def is_connected(self):
         return self.mc is not None
@@ -57,9 +59,10 @@ class MyCobotBridge:
         action = data.get("action", "")
         try:
             if action == "send_angles":
-                angles = data.get("angles", [0]*6)
+                angles = data.get("angles", [0] * 6)
                 speed = data.get("speed", self._speed)
                 self.mc.send_angles(angles, speed)
+                self._last_angles = angles
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "send_angle":
@@ -70,9 +73,11 @@ class MyCobotBridge:
                 return {"type": "response", "action": action, "status": "ok", "joint": joint, "angle": angle}
 
             elif action == "send_coords":
-                coords = data.get("coords", [0]*6)
+                coords = data.get("coords", [0] * 6)
                 speed = data.get("speed", self._speed)
-                self.mc.send_coords(coords, speed, 0)
+                mode = data.get("mode", 0)  # 0=angular, 1=linear
+                self.mc.send_coords(coords, speed, mode)
+                self._last_coords = coords
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_angle":
@@ -87,6 +92,27 @@ class MyCobotBridge:
                 direction = data.get("direction", 1)
                 speed = data.get("speed", 30)
                 self.mc.jog_coord(axis, direction, speed)
+                return {"type": "response", "action": action, "status": "ok"}
+
+            elif action == "jog_increment_angle":
+                joint = data.get("joint", 1)
+                increment = data.get("angle", 1)
+                speed = data.get("speed", 50)
+                # Use cached angles to avoid extra serial read
+                new_angles = list(self._last_angles)
+                new_angles[joint - 1] += increment
+                self.mc.send_angles(new_angles, speed)
+                self._last_angles = new_angles
+                return {"type": "response", "action": action, "status": "ok"}
+
+            elif action == "jog_increment_coord":
+                axis = data.get("axis", 1)
+                increment = data.get("value", 1)
+                speed = data.get("speed", 50)
+                new_coords = list(self._last_coords)
+                new_coords[axis - 1] += increment
+                self.mc.send_coords(new_coords, speed, 0)
+                self._last_coords = new_coords
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_stop":
@@ -105,8 +131,17 @@ class MyCobotBridge:
                 self.mc.stop()
                 return {"type": "response", "action": action, "status": "ok"}
 
+            elif action == "pause":
+                self.mc.pause()
+                return {"type": "response", "action": action, "status": "ok"}
+
+            elif action == "resume":
+                self.mc.resume()
+                return {"type": "response", "action": action, "status": "ok"}
+
             elif action == "home":
-                self.mc.send_angles([0]*6, 25)
+                self.mc.send_angles([0] * 6, 25)
+                self._last_angles = [0.0] * 6
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "set_speed":
@@ -137,13 +172,28 @@ class MyCobotBridge:
                 self.mc.release_all_servos()
                 return {"type": "response", "action": action, "status": "ok"}
 
+            elif action == "focus_all_servos":
+                for j in range(1, 7):
+                    self.mc.focus_servo(j)
+                return {"type": "response", "action": action, "status": "ok"}
+
             elif action == "get_angles":
                 angles = self.mc.get_angles()
-                return {"type": "response", "action": action, "status": "ok", "angles": angles}
+                if angles:
+                    self._last_angles = angles
+                return {"type": "response", "action": action, "status": "ok", "angles": angles or self._last_angles}
 
             elif action == "get_coords":
                 coords = self.mc.get_coords()
-                return {"type": "response", "action": action, "status": "ok", "coords": coords}
+                if coords:
+                    self._last_coords = coords
+                return {"type": "response", "action": action, "status": "ok", "coords": coords or self._last_coords}
+
+            elif action == "get_speed":
+                return {"type": "response", "action": action, "status": "ok", "speed": self._speed}
+
+            elif action == "get_acceleration":
+                return {"type": "response", "action": action, "status": "ok", "acceleration": self._acceleration}
 
             else:
                 return {"type": "response", "action": action, "status": "error", "message": f"Unknown action: {action}"}
@@ -157,8 +207,8 @@ class MyCobotBridge:
         if not self.mc:
             return {
                 "type": "telemetry",
-                "angles": [0]*6,
-                "coords": [0]*6,
+                "angles": [0] * 6,
+                "coords": [0] * 6,
                 "speed": self._speed,
                 "acceleration": self._acceleration,
                 "is_moving": False,
@@ -166,10 +216,20 @@ class MyCobotBridge:
             }
 
         try:
-            angles = self.mc.get_angles() or [0]*6
-            coords = self.mc.get_coords() or [0]*6
-            is_moving = self.mc.is_moving() or False
-            is_powered = self.mc.is_power_on() or False
+            angles = self.mc.get_angles()
+            if angles:
+                self._last_angles = angles
+            else:
+                angles = self._last_angles
+
+            coords = self.mc.get_coords()
+            if coords:
+                self._last_coords = coords
+            else:
+                coords = self._last_coords
+
+            is_moving = self.mc.is_moving()
+            is_powered = self.mc.is_power_on()
 
             return {
                 "type": "telemetry",
@@ -177,15 +237,15 @@ class MyCobotBridge:
                 "coords": coords,
                 "speed": self._speed,
                 "acceleration": self._acceleration,
-                "is_moving": is_moving,
-                "is_powered": is_powered,
+                "is_moving": bool(is_moving),
+                "is_powered": bool(is_powered),
             }
         except Exception as e:
             logger.error(f"Telemetry read error: {e}")
             return {
                 "type": "telemetry",
-                "angles": [0]*6,
-                "coords": [0]*6,
+                "angles": self._last_angles,
+                "coords": self._last_coords,
                 "speed": self._speed,
                 "acceleration": self._acceleration,
                 "is_moving": False,
@@ -231,12 +291,8 @@ async def handle_connection(websocket):
         async for message in websocket:
             try:
                 data = json.loads(message)
-                if data.get("type") == "command":
-                    response = bridge.execute_command(data)
-                    await websocket.send(json.dumps(response))
-                else:
-                    response = bridge.execute_command(data)
-                    await websocket.send(json.dumps(response))
+                response = bridge.execute_command(data)
+                await websocket.send(json.dumps(response))
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({
                     "type": "response", "status": "error", "message": "Invalid JSON"
