@@ -35,7 +35,15 @@ class MyCobotBridge:
         try:
             self.mc = MyCobot320(port, baudrate)
             self.mc.power_on()
+            time.sleep(0.5)
+            # Set coordinate system: 0=base frame
+            self.mc.set_reference_frame(0)
+            time.sleep(0.1)
+            # Set movement type: 0=moveJ (joint interpolation)
+            self.mc.set_movement_type(0)
+            time.sleep(0.1)
             logger.info(f"myCobot 320 connected on {port} at {baudrate} baud")
+            logger.info(f"Reference frame: base, Movement type: moveJ")
         except Exception as e:
             logger.error(f"Failed to connect to myCobot: {e}")
             self.mc = None
@@ -76,6 +84,7 @@ class MyCobotBridge:
                 coords = data.get("coords", [0] * 6)
                 speed = data.get("speed", self._speed)
                 mode = data.get("mode", 0)  # 0=angular, 1=linear
+                logger.info(f"send_coords: coords={coords}, speed={speed}, mode={mode}")
                 self.mc.send_coords(coords, speed, mode)
                 self._last_coords = coords
                 return {"type": "response", "action": action, "status": "ok"}
