@@ -2,6 +2,7 @@
 myCobot 320 Pi Bridge — WebSocket Server
 Lightweight bridge between FastAPI backend and myCobot hardware.
 Uses adaptive telemetry polling: 2Hz idle, 5Hz moving, 0Hz disconnected.
+Streaming commands use latest-wins buffering to prevent lag and jitter.
 """
 
 import asyncio
@@ -14,6 +15,13 @@ import serial.tools.list_ports
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Actions that benefit from latest-wins command buffering.
+# Rapid slider / jog commands drop stale intermediate values.
+STREAMING_ACTIONS = {
+    "send_coords", "send_angles", "send_angle",
+    "jog_increment_coord", "jog_increment_angle",
+}
 
 
 def get_mycobot_port():
@@ -39,18 +47,25 @@ class MyCobotBridge:
             # Set coordinate system: 0=base frame
             self.mc.set_reference_frame(0)
             time.sleep(0.1)
-            # Set movement type: 0=moveJ (joint interpolation)
-            self.mc.set_movement_type(0)
+            # Set movement type: 1=moveL (linear/Cartesian interpolation)
+            self.mc.set_movement_type(1)
             time.sleep(0.1)
+            # Enable fresh mode: firmware always executes latest command first,
+            # dropping queued but unexecuted commands.
+            try:
+                self.mc.set_fresh_mode(1)
+                time.sleep(0.1)
+            except AttributeError:
+                pass  # older pymycobot versions may not have set_fresh_mode
             logger.info(f"myCobot 320 connected on {port} at {baudrate} baud")
-            logger.info(f"Reference frame: base, Movement type: moveJ")
+            logger.info(f"Reference frame: base, Movement type: moveL, Fresh mode: on")
         except Exception as e:
             logger.error(f"Failed to connect to myCobot: {e}")
             self.mc = None
 
         self.client_connected = False
         self.poll_interval_idle = 0.5      # 2Hz
-        self.poll_interval_moving = 0.2    # 5Hz (less aggressive to avoid serial contention)
+        self.poll_interval_moving = 0.2    # 5Hz
         self._speed = 50
         self._acceleration = 30
         self._last_angles = [0.0] * 6
@@ -69,7 +84,7 @@ class MyCobotBridge:
             if action == "send_angles":
                 angles = data.get("angles", [0] * 6)
                 speed = data.get("speed", self._speed)
-                self.mc.send_angles(angles, speed)
+                self.mc.send_angles(angles, speed, _async=True)
                 self._last_angles = angles
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -77,18 +92,18 @@ class MyCobotBridge:
                 joint = data.get("joint", 1)
                 angle = data.get("angle", 0)
                 speed = data.get("speed", self._speed)
-                self.mc.send_angle(joint, angle, speed)
+                self.mc.send_angle(joint, angle, speed, _async=True)
                 return {"type": "response", "action": action, "status": "ok", "joint": joint, "angle": angle}
 
             elif action == "send_coords":
                 coords = data.get("coords", [0] * 6)
                 speed = data.get("speed", self._speed)
-                mode = data.get("mode", None)  # None = default protocol with reply
+                mode = data.get("mode", None)
                 logger.info(f"send_coords: coords={coords}, speed={speed}, mode={mode}")
                 if mode is not None:
-                    self.mc.send_coords(coords, speed, mode)
+                    self.mc.send_coords(coords, speed, mode, _async=True)
                 else:
-                    self.mc.send_coords(coords, speed)
+                    self.mc.send_coords(coords, speed, _async=True)
                 self._last_coords = coords
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -96,14 +111,14 @@ class MyCobotBridge:
                 joint = data.get("joint", 1)
                 direction = data.get("direction", 1)
                 speed = data.get("speed", 30)
-                self.mc.jog_angle(joint, direction, speed)
+                self.mc.jog_angle(joint, direction, speed, _async=True)
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_coord":
                 axis = data.get("axis", 1)
                 direction = data.get("direction", 1)
                 speed = data.get("speed", 30)
-                self.mc.jog_coord(axis, direction, speed)
+                self.mc.jog_coord(axis, direction, speed, _async=True)
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_increment_angle":
@@ -113,7 +128,7 @@ class MyCobotBridge:
                 # Use cached angles to avoid extra serial read
                 new_angles = list(self._last_angles)
                 new_angles[joint - 1] += increment
-                self.mc.send_angles(new_angles, speed)
+                self.mc.send_angles(new_angles, speed, _async=True)
                 self._last_angles = new_angles
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -123,7 +138,7 @@ class MyCobotBridge:
                 speed = data.get("speed", 50)
                 new_coords = list(self._last_coords)
                 new_coords[axis - 1] += increment
-                self.mc.send_coords(new_coords, speed)
+                self.mc.send_coords(new_coords, speed, _async=True)
                 self._last_coords = new_coords
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -152,7 +167,7 @@ class MyCobotBridge:
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "home":
-                self.mc.send_angles([0] * 6, 25)
+                self.mc.send_angles([0] * 6, 25, _async=True)
                 self._last_angles = [0.0] * 6
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -283,11 +298,16 @@ async def telemetry_loop(websocket):
 
 
 async def handle_connection(websocket):
-    """Handle WebSocket connection from FastAPI backend"""
+    """Handle WebSocket connection from FastAPI backend.
+
+    Uses latest-wins buffering for streaming actions (send_coords, etc.)
+    so rapid slider movements don't queue up stale commands.
+    Non-streaming actions (power, home, stop) execute immediately.
+    All serial I/O runs in a thread pool to avoid blocking the event loop.
+    """
     global bridge
     logger.info("Backend connected")
 
-    # Send welcome
     await websocket.send(json.dumps({
         "type": "connected",
         "message": "myCobot 320 Pi bridge ready",
@@ -296,15 +316,62 @@ async def handle_connection(websocket):
 
     bridge.client_connected = True
 
-    # Start telemetry loop as a task
+    # Latest-wins command slot for streaming actions
+    command_slot = {"data": None}
+    command_event = asyncio.Event()
+
+    async def command_consumer():
+        """Consume the latest streaming command, dropping stale intermediates."""
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                await command_event.wait()
+                command_event.clear()
+
+                # Brief debounce: if a newer command arrived, skip this one
+                await asyncio.sleep(0.015)
+                if command_event.is_set():
+                    continue
+
+                cmd = command_slot["data"]
+                command_slot["data"] = None
+                if cmd is None:
+                    continue
+
+                try:
+                    response = await loop.run_in_executor(
+                        None, bridge.execute_command, cmd
+                    )
+                    if response:
+                        await websocket.send(json.dumps(response))
+                except Exception as e:
+                    logger.error(f"Streaming command error: {e}")
+        except asyncio.CancelledError:
+            return
+
+    # Start telemetry and command consumer tasks
     telemetry_task = asyncio.create_task(telemetry_loop(websocket))
+    consumer_task = asyncio.create_task(command_consumer())
 
     try:
         async for message in websocket:
             try:
                 data = json.loads(message)
-                response = bridge.execute_command(data)
-                await websocket.send(json.dumps(response))
+                action = data.get("action", "")
+
+                if action in STREAMING_ACTIONS:
+                    # Place in slot — latest command wins
+                    command_slot["data"] = data
+                    command_event.set()
+                else:
+                    # Immediate commands: execute in thread pool
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(
+                        None, bridge.execute_command, data
+                    )
+                    if response:
+                        await websocket.send(json.dumps(response))
+
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({
                     "type": "response", "status": "error", "message": "Invalid JSON"
@@ -318,6 +385,7 @@ async def handle_connection(websocket):
     finally:
         bridge.client_connected = False
         telemetry_task.cancel()
+        consumer_task.cancel()
         logger.info("Backend disconnected")
 
 
