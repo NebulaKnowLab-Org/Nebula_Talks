@@ -83,9 +83,12 @@ class MyCobotBridge:
             elif action == "send_coords":
                 coords = data.get("coords", [0] * 6)
                 speed = data.get("speed", self._speed)
-                mode = data.get("mode", 0)  # 0=angular, 1=linear
+                mode = data.get("mode", None)  # None = default protocol with reply
                 logger.info(f"send_coords: coords={coords}, speed={speed}, mode={mode}")
-                self.mc.send_coords(coords, speed, mode)
+                if mode is not None:
+                    self.mc.send_coords(coords, speed, mode)
+                else:
+                    self.mc.send_coords(coords, speed)
                 self._last_coords = coords
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -120,7 +123,7 @@ class MyCobotBridge:
                 speed = data.get("speed", 50)
                 new_coords = list(self._last_coords)
                 new_coords[axis - 1] += increment
-                self.mc.send_coords(new_coords, speed, 0)
+                self.mc.send_coords(new_coords, speed)
                 self._last_coords = new_coords
                 return {"type": "response", "action": action, "status": "ok"}
 
