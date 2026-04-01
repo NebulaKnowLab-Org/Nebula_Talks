@@ -2,7 +2,15 @@
 myCobot 320 Pi Bridge — WebSocket Server
 Lightweight bridge between FastAPI backend and myCobot hardware.
 Uses adaptive telemetry polling: 2Hz idle, 5Hz moving, 0Hz disconnected.
-Streaming commands use latest-wins buffering to prevent lag and jitter.
+
+Key design decisions:
+- send_coords() always uses mode=1 (moveL + no-reply protocol)
+  This is the ONLY way to get fire-and-forget on MyCobot320.
+  _async=True does NOT work — MyCobot320._res() ignores it.
+- jog_increment_coord() uses the native firmware command (0x34)
+  instead of manual read-modify-send.
+- set_fresh_mode(1): firmware interrupts current motion for latest command.
+- ALL serial I/O runs in thread pool — event loop never blocks.
 """
 
 import asyncio
@@ -16,11 +24,13 @@ import serial.tools.list_ports
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Actions that benefit from latest-wins command buffering.
-# Rapid slider / jog commands drop stale intermediate values.
+# Streaming actions use latest-wins command slot.
+# Only the most recent command is dispatched; stale ones are dropped.
 STREAMING_ACTIONS = {
-    "send_coords", "send_angles", "send_angle",
-    "jog_increment_coord", "jog_increment_angle",
+    "send_angles",
+    "send_angle",
+    "jog_increment_coord",
+    "jog_increment_angle",
 }
 
 
@@ -44,47 +54,125 @@ class MyCobotBridge:
             self.mc = MyCobot320(port, baudrate)
             self.mc.power_on()
             time.sleep(0.5)
-            # Set coordinate system: 0=base frame
+            # Coordinate system: 0 = base frame
             self.mc.set_reference_frame(0)
             time.sleep(0.1)
-            # Set movement type: 1=moveL (linear/Cartesian interpolation)
+            # moveL: linear interpolation for straight-line Cartesian paths.
+            # Also acts as the default if send_coords is called without mode.
             self.mc.set_movement_type(1)
             time.sleep(0.1)
-            # Enable fresh mode: firmware always executes latest command first,
-            # dropping queued but unexecuted commands.
+            # Fresh mode: firmware always interrupts current motion and
+            # executes the latest command. Essential for real-time control.
             try:
                 self.mc.set_fresh_mode(1)
                 time.sleep(0.1)
             except AttributeError:
-                pass  # older pymycobot versions may not have set_fresh_mode
+                logger.warning("set_fresh_mode not available — update pymycobot")
             logger.info(f"myCobot 320 connected on {port} at {baudrate} baud")
-            logger.info(f"Reference frame: base, Movement type: moveL, Fresh mode: on")
+            logger.info("Config: base frame, moveL, fresh mode on")
         except Exception as e:
             logger.error(f"Failed to connect to myCobot: {e}")
             self.mc = None
 
         self.client_connected = False
-        self.poll_interval_idle = 0.5      # 2Hz
-        self.poll_interval_moving = 0.2    # 5Hz
+        self.poll_interval_idle = 0.5  # 2Hz
+        self.poll_interval_moving = 0.2  # 5Hz
         self._speed = 50
         self._acceleration = 30
         self._last_angles = [0.0] * 6
         self._last_coords = [0.0] * 6
+        self._precise_active = False
+        self._precise_target = None
+        self._precise_request_id = None
+        self._precise_settle_count = 0
+        self._precise_started_at = 0.0
+        self._precise_pos_tol_mm = 1.0
+        self._precise_rot_tol_deg = 1.0
+        self._precise_settle_samples = 3
+        self._precise_timeout_s = 20.0
+
+    def _clear_precise_move(self):
+        self._precise_active = False
+        self._precise_target = None
+        self._precise_request_id = None
+        self._precise_settle_count = 0
+        self._precise_started_at = 0.0
+
+    @staticmethod
+    def _angle_error_deg(target, current):
+        diff = (target - current + 180.0) % 360.0 - 180.0
+        return abs(diff)
+
+    def check_precise_completion(self, telemetry: dict):
+        if not self._precise_active or not self._precise_target:
+            return None
+
+        coords = telemetry.get("coords", self._last_coords)
+        is_moving = bool(telemetry.get("is_moving", False))
+
+        pos_err = max(abs(self._precise_target[i] - coords[i]) for i in range(3))
+        rot_err = max(
+            self._angle_error_deg(self._precise_target[i], coords[i])
+            for i in range(3, 6)
+        )
+
+        if (
+            not is_moving
+            and pos_err <= self._precise_pos_tol_mm
+            and rot_err <= self._precise_rot_tol_deg
+        ):
+            self._precise_settle_count += 1
+        else:
+            self._precise_settle_count = 0
+
+        if self._precise_settle_count >= self._precise_settle_samples:
+            request_id = self._precise_request_id
+            self._clear_precise_move()
+            return {
+                "type": "response",
+                "action": "send_coords",
+                "mode": "precise",
+                "phase": "done",
+                "status": "ok",
+                "request_id": request_id,
+            }
+
+        if (
+            self._precise_started_at
+            and (time.time() - self._precise_started_at) > self._precise_timeout_s
+        ):
+            request_id = self._precise_request_id
+            self._clear_precise_move()
+            return {
+                "type": "response",
+                "action": "send_coords",
+                "mode": "precise",
+                "phase": "done",
+                "status": "error",
+                "message": "Precise move timeout",
+                "request_id": request_id,
+            }
+
+        return None
 
     def is_connected(self):
         return self.mc is not None
 
     def execute_command(self, data: dict) -> dict:
-        """Execute a single command and return response"""
+        """Execute a single command and return response dict."""
         if not self.mc:
-            return {"type": "response", "status": "error", "message": "Robot not connected"}
+            return {
+                "type": "response",
+                "status": "error",
+                "message": "Robot not connected",
+            }
 
         action = data.get("action", "")
         try:
             if action == "send_angles":
                 angles = data.get("angles", [0] * 6)
                 speed = data.get("speed", self._speed)
-                self.mc.send_angles(angles, speed, _async=True)
+                self.mc.send_angles(angles, speed)
                 self._last_angles = angles
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -92,43 +180,85 @@ class MyCobotBridge:
                 joint = data.get("joint", 1)
                 angle = data.get("angle", 0)
                 speed = data.get("speed", self._speed)
-                self.mc.send_angle(joint, angle, speed, _async=True)
-                return {"type": "response", "action": action, "status": "ok", "joint": joint, "angle": angle}
+                self.mc.send_angle(joint, angle, speed)
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "joint": joint,
+                    "angle": angle,
+                }
 
             elif action == "send_coords":
-                coords = data.get("coords", [0] * 6)
-                speed = data.get("speed", self._speed)
-                mode = data.get("mode", None)
-                logger.info(f"send_coords: coords={coords}, speed={speed}, mode={mode}")
-                if mode is not None:
-                    self.mc.send_coords(coords, speed, mode, _async=True)
-                else:
-                    self.mc.send_coords(coords, speed, _async=True)
+                raw_coords = data.get("coords", [0] * 6)
+                coords = [float(v) for v in list(raw_coords)[:6]]
+                if len(coords) < 6:
+                    coords.extend([0.0] * (6 - len(coords)))
+                speed = int(float(data.get("speed", self._speed)))
+                mode = data.get("mode", "jog")
+                request_id = data.get("request_id")
+                # mode=1 does TWO things:
+                #   1. Linear interpolation (moveL) — straight-line path
+                #   2. Fire-and-forget at protocol level — no serial reply wait
+                # Without mode, MyCobot320 blocks ~300s waiting for reply.
+                if mode == "precise":
+                    if self._precise_active:
+                        return {
+                            "type": "response",
+                            "action": action,
+                            "mode": "precise",
+                            "phase": "accepted",
+                            "status": "busy",
+                            "message": "Precise move already in progress",
+                            "request_id": request_id,
+                        }
+
+                    self.mc.send_coords(coords, speed, 1)
+                    self._last_coords = coords
+                    self._precise_active = True
+                    self._precise_target = list(coords)
+                    self._precise_request_id = request_id
+                    self._precise_settle_count = 0
+                    self._precise_started_at = time.time()
+                    return {
+                        "type": "response",
+                        "action": action,
+                        "mode": "precise",
+                        "phase": "accepted",
+                        "status": "ok",
+                        "request_id": request_id,
+                    }
+
+                self.mc.send_coords(coords, speed, 1)
                 self._last_coords = coords
-                return {"type": "response", "action": action, "status": "ok"}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "mode": "jog",
+                    "status": "ok",
+                }
 
             elif action == "jog_angle":
                 joint = data.get("joint", 1)
                 direction = data.get("direction", 1)
                 speed = data.get("speed", 30)
-                self.mc.jog_angle(joint, direction, speed, _async=True)
+                self.mc.jog_angle(joint, direction, speed)
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_coord":
                 axis = data.get("axis", 1)
                 direction = data.get("direction", 1)
                 speed = data.get("speed", 30)
-                self.mc.jog_coord(axis, direction, speed, _async=True)
+                self.mc.jog_coord(axis, direction, speed)
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_increment_angle":
                 joint = data.get("joint", 1)
                 increment = data.get("angle", 1)
                 speed = data.get("speed", 50)
-                # Use cached angles to avoid extra serial read
                 new_angles = list(self._last_angles)
                 new_angles[joint - 1] += increment
-                self.mc.send_angles(new_angles, speed, _async=True)
+                self.mc.send_angles(new_angles, speed)
                 self._last_angles = new_angles
                 return {"type": "response", "action": action, "status": "ok"}
 
@@ -136,14 +266,19 @@ class MyCobotBridge:
                 axis = data.get("axis", 1)
                 increment = data.get("value", 1)
                 speed = data.get("speed", 50)
+                # Native firmware command (protocol 0x34): moves one axis
+                # by a relative increment. Much faster than read-modify-send
+                # because the firmware handles it internally.
+                self.mc.jog_increment_coord(axis, increment, speed)
+                # Optimistically update cache
                 new_coords = list(self._last_coords)
                 new_coords[axis - 1] += increment
-                self.mc.send_coords(new_coords, speed, _async=True)
                 self._last_coords = new_coords
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "jog_stop":
                 self.mc.stop()
+                self._clear_precise_move()
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "power_on":
@@ -156,6 +291,7 @@ class MyCobotBridge:
 
             elif action == "stop":
                 self.mc.stop()
+                self._clear_precise_move()
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "pause":
@@ -167,17 +303,28 @@ class MyCobotBridge:
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "home":
-                self.mc.send_angles([0] * 6, 25, _async=True)
+                self.mc.send_angles([0] * 6, 25)
                 self._last_angles = [0.0] * 6
+                self._clear_precise_move()
                 return {"type": "response", "action": action, "status": "ok"}
 
             elif action == "set_speed":
                 self._speed = data.get("speed", 50)
-                return {"type": "response", "action": action, "status": "ok", "speed": self._speed}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "speed": self._speed,
+                }
 
             elif action == "set_acceleration":
                 self._acceleration = data.get("acceleration", 30)
-                return {"type": "response", "action": action, "status": "ok", "acceleration": self._acceleration}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "acceleration": self._acceleration,
+                }
 
             elif action == "set_gripper":
                 value = data.get("value", 50)
@@ -208,29 +355,59 @@ class MyCobotBridge:
                 angles = self.mc.get_angles()
                 if angles:
                     self._last_angles = angles
-                return {"type": "response", "action": action, "status": "ok", "angles": angles or self._last_angles}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "angles": angles or self._last_angles,
+                }
 
             elif action == "get_coords":
                 coords = self.mc.get_coords()
                 if coords:
                     self._last_coords = coords
-                return {"type": "response", "action": action, "status": "ok", "coords": coords or self._last_coords}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "coords": coords or self._last_coords,
+                }
 
             elif action == "get_speed":
-                return {"type": "response", "action": action, "status": "ok", "speed": self._speed}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "speed": self._speed,
+                }
 
             elif action == "get_acceleration":
-                return {"type": "response", "action": action, "status": "ok", "acceleration": self._acceleration}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "ok",
+                    "acceleration": self._acceleration,
+                }
 
             else:
-                return {"type": "response", "action": action, "status": "error", "message": f"Unknown action: {action}"}
+                return {
+                    "type": "response",
+                    "action": action,
+                    "status": "error",
+                    "message": f"Unknown action: {action}",
+                }
 
         except Exception as e:
             logger.error(f"Error executing {action}: {e}")
-            return {"type": "response", "action": action, "status": "error", "message": str(e)}
+            return {
+                "type": "response",
+                "action": action,
+                "status": "error",
+                "message": str(e),
+            }
 
     def get_telemetry(self) -> dict:
-        """Read current robot state"""
+        """Read current robot state via serial."""
         if not self.mc:
             return {
                 "type": "telemetry",
@@ -284,54 +461,61 @@ bridge = None
 
 
 async def telemetry_loop(websocket):
-    """Adaptive telemetry streaming"""
+    """Adaptive telemetry streaming.
+    Serial reads run in thread pool so the event loop stays responsive.
+    """
+    loop = asyncio.get_event_loop()
     while bridge.client_connected:
-        telemetry = bridge.get_telemetry()
+        telemetry = await loop.run_in_executor(None, bridge.get_telemetry)
         try:
             await websocket.send(json.dumps(telemetry))
+            precise_done = bridge.check_precise_completion(telemetry)
+            if precise_done:
+                await websocket.send(json.dumps(precise_done))
         except Exception:
             break
 
         is_moving = telemetry.get("is_moving", False)
-        interval = bridge.poll_interval_moving if is_moving else bridge.poll_interval_idle
+        interval = (
+            bridge.poll_interval_moving if is_moving else bridge.poll_interval_idle
+        )
         await asyncio.sleep(interval)
 
 
 async def handle_connection(websocket):
     """Handle WebSocket connection from FastAPI backend.
 
-    Uses latest-wins buffering for streaming actions (send_coords, etc.)
-    so rapid slider movements don't queue up stale commands.
-    Non-streaming actions (power, home, stop) execute immediately.
-    All serial I/O runs in a thread pool to avoid blocking the event loop.
+    Streaming commands (send_coords, jog_increment_coord, etc.) use a
+    latest-wins slot — only the most recent command is dispatched.
+    Non-streaming commands (power, home, stop) execute immediately.
+    All serial I/O runs in a thread pool so telemetry is never blocked.
     """
     global bridge
     logger.info("Backend connected")
 
-    await websocket.send(json.dumps({
-        "type": "connected",
-        "message": "myCobot 320 Pi bridge ready",
-        "robot": "myCobot 320 Pi",
-    }))
+    await websocket.send(
+        json.dumps(
+            {
+                "type": "connected",
+                "message": "myCobot 320 Pi bridge ready",
+                "robot": "myCobot 320 Pi",
+            }
+        )
+    )
 
     bridge.client_connected = True
 
     # Latest-wins command slot for streaming actions
     command_slot = {"data": None}
     command_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
 
     async def command_consumer():
-        """Consume the latest streaming command, dropping stale intermediates."""
-        loop = asyncio.get_event_loop()
+        """Execute the most recent streaming command, skipping stale ones."""
         try:
             while True:
                 await command_event.wait()
                 command_event.clear()
-
-                # Brief debounce: if a newer command arrived, skip this one
-                await asyncio.sleep(0.015)
-                if command_event.is_set():
-                    continue
 
                 cmd = command_slot["data"]
                 command_slot["data"] = None
@@ -345,7 +529,7 @@ async def handle_connection(websocket):
                     if response:
                         await websocket.send(json.dumps(response))
                 except Exception as e:
-                    logger.error(f"Streaming command error: {e}")
+                    logger.error(f"Command consumer error: {e}")
         except asyncio.CancelledError:
             return
 
@@ -359,13 +543,23 @@ async def handle_connection(websocket):
                 data = json.loads(message)
                 action = data.get("action", "")
 
-                if action in STREAMING_ACTIONS:
-                    # Place in slot — latest command wins
+                if action == "send_coords":
+                    mode = data.get("mode", "jog")
+                    if mode == "jog":
+                        command_slot["data"] = data
+                        command_event.set()
+                    else:
+                        response = await loop.run_in_executor(
+                            None, bridge.execute_command, data
+                        )
+                        if response:
+                            await websocket.send(json.dumps(response))
+                elif action in STREAMING_ACTIONS:
+                    # Latest command wins — overwrite slot
                     command_slot["data"] = data
                     command_event.set()
                 else:
                     # Immediate commands: execute in thread pool
-                    loop = asyncio.get_event_loop()
                     response = await loop.run_in_executor(
                         None, bridge.execute_command, data
                     )
@@ -373,13 +567,21 @@ async def handle_connection(websocket):
                         await websocket.send(json.dumps(response))
 
             except json.JSONDecodeError:
-                await websocket.send(json.dumps({
-                    "type": "response", "status": "error", "message": "Invalid JSON"
-                }))
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "response",
+                            "status": "error",
+                            "message": "Invalid JSON",
+                        }
+                    )
+                )
             except Exception as e:
-                await websocket.send(json.dumps({
-                    "type": "response", "status": "error", "message": str(e)
-                }))
+                await websocket.send(
+                    json.dumps(
+                        {"type": "response", "status": "error", "message": str(e)}
+                    )
+                )
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
