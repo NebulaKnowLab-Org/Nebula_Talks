@@ -323,7 +323,7 @@ class MyCobotBridge:
                     active_axes = [i for i, enabled in enumerate(mask) if enabled]
                     dispatch_attempts = []
 
-                    if len(active_axes) == 1:
+                    if len(active_axes) == 1 and active_axes[0] < 3:
                         axis_idx = active_axes[0]
                         axis_id = axis_idx + 1
                         axis_target = float(coords[axis_idx])
@@ -356,6 +356,12 @@ class MyCobotBridge:
                             (
                                 "send_coords",
                                 lambda: self.mc.send_coords(coords, speed, 1),
+                            )
+                        )
+                        dispatch_attempts.append(
+                            (
+                                "send_coords_movej",
+                                lambda: self.mc.send_coords(coords, speed, 0),
                             )
                         )
 
