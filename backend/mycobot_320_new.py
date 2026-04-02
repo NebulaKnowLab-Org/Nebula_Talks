@@ -131,6 +131,23 @@ class MyCobotBridge:
         )
         return pos_err, rot_err
 
+    def _wait_motion_start_or_reach(self, target, mask, timeout_s=1.5):
+        latest_coords = self._last_coords
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            latest_coords = self.mc.get_coords() or latest_coords
+            is_moving_now = bool(self.mc.is_moving())
+            pos_err, rot_err = self._masked_errors(target, latest_coords, mask)
+            if is_moving_now:
+                return True, False, latest_coords
+            if (
+                pos_err <= self._precise_pos_tol_mm
+                and rot_err <= self._precise_rot_tol_deg
+            ):
+                return False, True, latest_coords
+            time.sleep(0.1)
+        return False, False, latest_coords
+
     def check_precise_completion(self, telemetry: dict):
         if not self._precise_active or not self._precise_target:
             return None
@@ -248,34 +265,61 @@ class MyCobotBridge:
                     else:
                         mask = [1, 1, 1, 1, 1, 1]
 
-                    self.mc.send_coords(coords, speed, 1)
-                    self._last_coords = coords
+                    active_axes = [i for i, enabled in enumerate(mask) if enabled]
+                    dispatch_attempts = []
+
+                    if len(active_axes) == 1:
+                        axis_idx = active_axes[0]
+                        axis_id = axis_idx + 1
+                        axis_target = float(coords[axis_idx])
+                        dispatch_attempts.append(
+                            (
+                                "send_coord",
+                                lambda: self.mc.send_coord(axis_id, axis_target, speed),
+                            )
+                        )
+
+                        current_coords = self.mc.get_coords() or self._last_coords
+                        delta = axis_target - float(current_coords[axis_idx])
+                        if abs(delta) > 0.2:
+                            dispatch_attempts.append(
+                                (
+                                    "jog_increment_coord",
+                                    lambda d=delta: self.mc.jog_increment_coord(
+                                        axis_id, d, speed
+                                    ),
+                                )
+                            )
+                    else:
+                        dispatch_attempts.append(
+                            (
+                                "send_coords",
+                                lambda: self.mc.send_coords(coords, speed, 1),
+                            )
+                        )
 
                     started = False
-                    start_deadline = time.time() + 1.5
-                    latest_coords = self._last_coords
-                    while time.time() < start_deadline:
-                        latest_coords = self.mc.get_coords() or latest_coords
-                        is_moving_now = bool(self.mc.is_moving())
-                        pos_err, rot_err = self._masked_errors(
-                            coords, latest_coords, mask
+                    near_target = False
+                    used_attempt = None
+                    for name, dispatch in dispatch_attempts:
+                        dispatch()
+                        self._last_coords = coords
+                        used_attempt = name
+                        started, near_target, _ = self._wait_motion_start_or_reach(
+                            coords, mask, 1.5
                         )
-                        if is_moving_now:
-                            started = True
+                        if started or near_target:
                             break
-                        if (
-                            pos_err <= self._precise_pos_tol_mm
-                            and rot_err <= self._precise_rot_tol_deg
-                        ):
-                            return {
-                                "type": "response",
-                                "action": action,
-                                "mode": "precise",
-                                "phase": "done",
-                                "status": "ok",
-                                "request_id": request_id,
-                            }
-                        time.sleep(0.1)
+
+                    if near_target:
+                        return {
+                            "type": "response",
+                            "action": action,
+                            "mode": "precise",
+                            "phase": "done",
+                            "status": "ok",
+                            "request_id": request_id,
+                        }
 
                     if not started:
                         try:
@@ -288,7 +332,7 @@ class MyCobotBridge:
                             "mode": "precise",
                             "phase": "done",
                             "status": "error",
-                            "message": f"Move did not start (robot error: {err_info})",
+                            "message": f"Move did not start after {used_attempt} (robot error: {err_info})",
                             "request_id": request_id,
                         }
 
