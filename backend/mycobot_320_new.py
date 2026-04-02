@@ -131,6 +131,38 @@ class MyCobotBridge:
         )
         return pos_err, rot_err
 
+    @staticmethod
+    def _extract_error_codes(raw):
+        if raw is None or raw == -1:
+            return []
+        if isinstance(raw, int):
+            return [raw] if raw > 0 else []
+        if isinstance(raw, list):
+            codes = []
+            for item in raw:
+                try:
+                    code = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if code > 0:
+                    codes.append(code)
+            return sorted(set(codes))
+        return []
+
+    @staticmethod
+    def _error_hint(codes):
+        hints = {
+            32: "IK no solution",
+            33: "linear path no adjacent solution",
+            34: "velocity blend error",
+            35: "zero-space no adjacent solution",
+            36: "singular position",
+            49: "robot not enabled/powered",
+            64: "target coordinate exceeds limit",
+        }
+        parts = [hints[c] for c in codes if c in hints]
+        return ", ".join(parts) if parts else None
+
     def _wait_motion_start_or_reach(self, target, mask, timeout_s=1.5):
         latest_coords = self._last_coords
         deadline = time.time() + timeout_s
@@ -147,6 +179,27 @@ class MyCobotBridge:
                 return False, True, latest_coords
             time.sleep(0.1)
         return False, False, latest_coords
+
+    def _ensure_motion_ready(self):
+        try:
+            if int(self.mc.is_power_on()) != 1:
+                self.mc.power_on()
+                time.sleep(0.2)
+        except Exception:
+            pass
+
+        try:
+            enabled = int(self.mc.is_all_servo_enable())
+        except Exception:
+            enabled = 1
+
+        if enabled != 1:
+            for joint in range(1, 7):
+                try:
+                    self.mc.focus_servo(joint)
+                except Exception:
+                    continue
+            time.sleep(0.15)
 
     def check_precise_completion(self, telemetry: dict):
         if not self._precise_active or not self._precise_target:
@@ -257,6 +310,8 @@ class MyCobotBridge:
                             "request_id": request_id,
                         }
 
+                    self._ensure_motion_ready()
+
                     if isinstance(axes_mask, list):
                         mask = [
                             1 if bool(v) else 0
@@ -290,6 +345,12 @@ class MyCobotBridge:
                                     ),
                                 )
                             )
+                        dispatch_attempts.append(
+                            (
+                                "send_coords_movej",
+                                lambda: self.mc.send_coords(coords, speed, 0),
+                            )
+                        )
                     else:
                         dispatch_attempts.append(
                             (
@@ -322,17 +383,68 @@ class MyCobotBridge:
                         }
 
                     if not started:
+                        # Last fallback: solve IK from current joint state and move in
+                        # joint space. This handles firmware cases where Cartesian
+                        # commands are accepted but cannot start due to adjacency /
+                        # singular constraints.
                         try:
-                            err_info = self.mc.read_next_error()
+                            current_angles = self.mc.get_angles() or self._last_angles
+                        except Exception:
+                            current_angles = self._last_angles
+
+                        try:
+                            ik_angles = self.mc.solve_inv_kinematics(
+                                coords, current_angles
+                            )
+                        except Exception:
+                            ik_angles = None
+
+                        if isinstance(ik_angles, list) and len(ik_angles) == 6:
+                            try:
+                                ik_angles = [float(v) for v in ik_angles]
+                                self.mc.send_angles(ik_angles, speed)
+                                used_attempt = "solve_inv_kinematics+send_angles"
+                                started, near_target, _ = (
+                                    self._wait_motion_start_or_reach(coords, mask, 2.0)
+                                )
+                                if near_target:
+                                    return {
+                                        "type": "response",
+                                        "action": action,
+                                        "mode": "precise",
+                                        "phase": "done",
+                                        "status": "ok",
+                                        "request_id": request_id,
+                                    }
+                            except Exception:
+                                started = False
+
+                        if started:
+                            self._last_angles = (
+                                ik_angles
+                                if isinstance(ik_angles, list) and len(ik_angles) == 6
+                                else self._last_angles
+                            )
+                        else:
+                            started = False
+
+                    if not started:
+                        try:
+                            err_info = self.mc.get_error_information()
                         except Exception:
                             err_info = None
+                        err_codes = self._extract_error_codes(err_info)
+                        hint = self._error_hint(err_codes)
+                        suffix = (
+                            f" (codes: {err_codes}; hint: {hint})" if err_codes else ""
+                        )
                         return {
                             "type": "response",
                             "action": action,
                             "mode": "precise",
                             "phase": "done",
                             "status": "error",
-                            "message": f"Move did not start after {used_attempt} (robot error: {err_info})",
+                            "message": f"Move did not start after {used_attempt} (robot error: {err_info}){suffix}",
                             "request_id": request_id,
                         }
 
@@ -342,12 +454,18 @@ class MyCobotBridge:
                     self._precise_settle_count = 0
                     self._precise_started_at = time.time()
                     self._precise_axes_mask = mask
+                    message = (
+                        "Linear start failed; using moveJ fallback"
+                        if used_attempt == "send_coords_movej"
+                        else None
+                    )
                     return {
                         "type": "response",
                         "action": action,
                         "mode": "precise",
                         "phase": "accepted",
                         "status": "ok",
+                        "message": message,
                         "request_id": request_id,
                     }
 
