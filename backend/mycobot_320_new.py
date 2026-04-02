@@ -4,12 +4,11 @@ Lightweight bridge between FastAPI backend and myCobot hardware.
 Uses adaptive telemetry polling: 2Hz idle, 5Hz moving, 0Hz disconnected.
 
 Key design decisions:
-- send_coords() always uses mode=1 (moveL + no-reply protocol)
-  This is the ONLY way to get fire-and-forget on MyCobot320.
-  _async=True does NOT work — MyCobot320._res() ignores it.
+- send_coords() uses mode=1 (moveL) for Cartesian linear planning.
 - jog_increment_coord() uses the native firmware command (0x34)
   instead of manual read-modify-send.
-- set_fresh_mode(1): firmware interrupts current motion for latest command.
+- set_fresh_mode(0): queue mode for stable Cartesian paths.
+- set_vision_mode(1): reduce posture flipping in refresh-related paths.
 - ALL serial I/O runs in thread pool — event loop never blocks.
 """
 
@@ -61,15 +60,22 @@ class MyCobotBridge:
             # Also acts as the default if send_coords is called without mode.
             self.mc.set_movement_type(1)
             time.sleep(0.1)
-            # Fresh mode: firmware always interrupts current motion and
-            # executes the latest command. Essential for real-time control.
+            # Fresh mode 0: execute commands in sequence. This avoids
+            # latest-command interruptions that can bend manual Cartesian paths.
             try:
-                self.mc.set_fresh_mode(1)
+                self.mc.set_fresh_mode(0)
                 time.sleep(0.1)
             except AttributeError:
                 logger.warning("set_fresh_mode not available — update pymycobot")
+            # Vision mode 1: firmware option to reduce posture flipping when
+            # Cartesian targets are updated in refresh-style control loops.
+            try:
+                self.mc.set_vision_mode(1)
+                time.sleep(0.1)
+            except AttributeError:
+                logger.warning("set_vision_mode not available — update pymycobot")
             logger.info(f"myCobot 320 connected on {port} at {baudrate} baud")
-            logger.info("Config: base frame, moveL, fresh mode on")
+            logger.info("Config: base frame, moveL, queue mode, vision mode on")
         except Exception as e:
             logger.error(f"Failed to connect to myCobot: {e}")
             self.mc = None
@@ -86,6 +92,7 @@ class MyCobotBridge:
         self._precise_request_id = None
         self._precise_settle_count = 0
         self._precise_started_at = 0.0
+        self._precise_axes_mask = [1, 1, 1, 1, 1, 1]
         self._precise_pos_tol_mm = 1.0
         self._precise_rot_tol_deg = 1.0
         self._precise_settle_samples = 3
@@ -97,6 +104,7 @@ class MyCobotBridge:
         self._precise_request_id = None
         self._precise_settle_count = 0
         self._precise_started_at = 0.0
+        self._precise_axes_mask = [1, 1, 1, 1, 1, 1]
 
     @staticmethod
     def _angle_error_deg(target, current):
@@ -110,10 +118,28 @@ class MyCobotBridge:
         coords = telemetry.get("coords", self._last_coords)
         is_moving = bool(telemetry.get("is_moving", False))
 
-        pos_err = max(abs(self._precise_target[i] - coords[i]) for i in range(3))
-        rot_err = max(
-            self._angle_error_deg(self._precise_target[i], coords[i])
-            for i in range(3, 6)
+        mask = (
+            self._precise_axes_mask
+            if isinstance(self._precise_axes_mask, list)
+            else [1, 1, 1, 1, 1, 1]
+        )
+        mask = (mask + [1, 1, 1, 1, 1, 1])[:6]
+
+        pos_indices = [i for i in range(3) if mask[i]]
+        rot_indices = [i for i in range(3, 6) if mask[i]]
+
+        pos_err = (
+            max(abs(self._precise_target[i] - coords[i]) for i in pos_indices)
+            if pos_indices
+            else 0.0
+        )
+        rot_err = (
+            max(
+                self._angle_error_deg(self._precise_target[i], coords[i])
+                for i in rot_indices
+            )
+            if rot_indices
+            else 0.0
         )
 
         if (
@@ -197,6 +223,7 @@ class MyCobotBridge:
                 speed = int(float(data.get("speed", self._speed)))
                 mode = data.get("mode", "jog")
                 request_id = data.get("request_id")
+                axes_mask = data.get("axes_mask", [1, 1, 1, 1, 1, 1])
                 # mode=1 does TWO things:
                 #   1. Linear interpolation (moveL) — straight-line path
                 #   2. Fire-and-forget at protocol level — no serial reply wait
@@ -220,6 +247,13 @@ class MyCobotBridge:
                     self._precise_request_id = request_id
                     self._precise_settle_count = 0
                     self._precise_started_at = time.time()
+                    if isinstance(axes_mask, list):
+                        self._precise_axes_mask = [
+                            1 if bool(v) else 0
+                            for v in (axes_mask + [1, 1, 1, 1, 1, 1])[:6]
+                        ]
+                    else:
+                        self._precise_axes_mask = [1, 1, 1, 1, 1, 1]
                     return {
                         "type": "response",
                         "action": action,
