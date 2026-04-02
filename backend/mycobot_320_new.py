@@ -111,6 +111,26 @@ class MyCobotBridge:
         diff = (target - current + 180.0) % 360.0 - 180.0
         return abs(diff)
 
+    def _masked_errors(self, target, current, mask):
+        m = (
+            (list(mask) + [1, 1, 1, 1, 1, 1])[:6]
+            if isinstance(mask, list)
+            else [1, 1, 1, 1, 1, 1]
+        )
+        pos_indices = [i for i in range(3) if m[i]]
+        rot_indices = [i for i in range(3, 6) if m[i]]
+        pos_err = (
+            max(abs(target[i] - current[i]) for i in pos_indices)
+            if pos_indices
+            else 0.0
+        )
+        rot_err = (
+            max(self._angle_error_deg(target[i], current[i]) for i in rot_indices)
+            if rot_indices
+            else 0.0
+        )
+        return pos_err, rot_err
+
     def check_precise_completion(self, telemetry: dict):
         if not self._precise_active or not self._precise_target:
             return None
@@ -118,28 +138,8 @@ class MyCobotBridge:
         coords = telemetry.get("coords", self._last_coords)
         is_moving = bool(telemetry.get("is_moving", False))
 
-        mask = (
-            self._precise_axes_mask
-            if isinstance(self._precise_axes_mask, list)
-            else [1, 1, 1, 1, 1, 1]
-        )
-        mask = (mask + [1, 1, 1, 1, 1, 1])[:6]
-
-        pos_indices = [i for i in range(3) if mask[i]]
-        rot_indices = [i for i in range(3, 6) if mask[i]]
-
-        pos_err = (
-            max(abs(self._precise_target[i] - coords[i]) for i in pos_indices)
-            if pos_indices
-            else 0.0
-        )
-        rot_err = (
-            max(
-                self._angle_error_deg(self._precise_target[i], coords[i])
-                for i in rot_indices
-            )
-            if rot_indices
-            else 0.0
+        pos_err, rot_err = self._masked_errors(
+            self._precise_target, coords, self._precise_axes_mask
         )
 
         if (
@@ -240,20 +240,64 @@ class MyCobotBridge:
                             "request_id": request_id,
                         }
 
+                    if isinstance(axes_mask, list):
+                        mask = [
+                            1 if bool(v) else 0
+                            for v in (axes_mask + [1, 1, 1, 1, 1, 1])[:6]
+                        ]
+                    else:
+                        mask = [1, 1, 1, 1, 1, 1]
+
                     self.mc.send_coords(coords, speed, 1)
                     self._last_coords = coords
+
+                    started = False
+                    start_deadline = time.time() + 1.5
+                    latest_coords = self._last_coords
+                    while time.time() < start_deadline:
+                        latest_coords = self.mc.get_coords() or latest_coords
+                        is_moving_now = bool(self.mc.is_moving())
+                        pos_err, rot_err = self._masked_errors(
+                            coords, latest_coords, mask
+                        )
+                        if is_moving_now:
+                            started = True
+                            break
+                        if (
+                            pos_err <= self._precise_pos_tol_mm
+                            and rot_err <= self._precise_rot_tol_deg
+                        ):
+                            return {
+                                "type": "response",
+                                "action": action,
+                                "mode": "precise",
+                                "phase": "done",
+                                "status": "ok",
+                                "request_id": request_id,
+                            }
+                        time.sleep(0.1)
+
+                    if not started:
+                        try:
+                            err_info = self.mc.read_next_error()
+                        except Exception:
+                            err_info = None
+                        return {
+                            "type": "response",
+                            "action": action,
+                            "mode": "precise",
+                            "phase": "done",
+                            "status": "error",
+                            "message": f"Move did not start (robot error: {err_info})",
+                            "request_id": request_id,
+                        }
+
                     self._precise_active = True
                     self._precise_target = list(coords)
                     self._precise_request_id = request_id
                     self._precise_settle_count = 0
                     self._precise_started_at = time.time()
-                    if isinstance(axes_mask, list):
-                        self._precise_axes_mask = [
-                            1 if bool(v) else 0
-                            for v in (axes_mask + [1, 1, 1, 1, 1, 1])[:6]
-                        ]
-                    else:
-                        self._precise_axes_mask = [1, 1, 1, 1, 1, 1]
+                    self._precise_axes_mask = mask
                     return {
                         "type": "response",
                         "action": action,
